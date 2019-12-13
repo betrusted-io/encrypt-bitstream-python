@@ -1,0 +1,10 @@
+set_property CONFIG_VOLTAGE 3.3 [current_design]
+set_property CFGBVS VCCO [current_design]
+set_property BITSTREAM.CONFIG.CONFIGRATE 66 [current_design]
+set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 1 [current_design]
+set_property BITSTREAM.ENCRYPTION.ENCRYPT YES [current_design]
+set_property BITSTREAM.ENCRYPTION.ENCRYPTKEYSELECT eFUSE [current_design]
+set_property BITSTREAM.ENCRYPTION.HKEY 256'h0 [current_design]
+set_property BITSTREAM.ENCRYPTION.STARTCBC 128'h0 [current_design]
+set_property BITSTREAM.ENCRYPTION.KEY0 256'hB000000000000000000000000000000000000000000000000000000000000003 [current_design]
+write_bitstream -force top.bit 

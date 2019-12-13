@@ -60,7 +60,7 @@ Prepare the footer:
 0000 0001 0000 0000 0000 0000 0000 0000
 0000 0000 0000 0000 0000 0000 00c0 0000
 
-At this point, it looks like an HMAC that is a SHA-384 hash is appended to
+At this point, it looks like an HMAC that is a SHA-256 hash is appended to
 the message. However, we have not been able to get a computed hash to line 
 up with the decrypted value output at the bottom of the file, so there
 is likely some additional trick to how the decrypted bitstream is fed into
@@ -69,17 +69,19 @@ the HMAC algorithm.
 Once prepared, this entire set is encrypted using AES-CBC.
 
 Note that the number 0x085b98 is immediately before the cipherext data (this is for
-the 35T), and this corresponds to 547,736 words or 2,190,944 bytes. This is curious
-because the length with HMAC code is 2,190,960, or 16 bytes longer than the total
-data length if the HMAC were a SHA-384. It would make sense for a SHA-256, but then
-what are the extra 16 bytes at the end for?
+the 35T), and this corresponds to 547,736 words or 2,190,944 bytes, which corresponds
+exactly to a 32-byte SHA-256 digest appended to the end of the entire stream including
+header and footer (including the extra weird 64 bytes at the end), that is, 2190912 bytes. 
+
+An extra 16-bytes of random-looking data appears after this length when you 
+"over-decrypt" because the repeating output of the CBC cipher doesn't start until 
+one block after the last block.
 
 
 Todo:
 * Figure out key byte order (mapping of eFuse bit order-to-AES)
 * Figure out IV byte order (presume it also has same bit re-ordering rules, but check)
-* Figure out HMAC protocol. Docs say SHA-256, but exactly which regions are hashed and 
-  if it's actually this hash is unclear (the data would fit a SHA-384 hash much better)
+* Figure out how the SHA-256 HMAC is applied to the bitstream.
 
 """
 
@@ -102,6 +104,28 @@ def xilinx_swizzle(data_block):
         i = i + 4
 
     return bytes(wordswapped)
+
+
+def hmac_format(data_block):
+    # swap all bits MSB-to-LSB in an 8-bit block
+    #bitswapped = bytearray()
+    #for byte in data_block:
+        # print(format(byte, '02x'))
+    #    bitswapped.extend(int('{:08b}'.format(byte)[::-1], 2).to_bytes(1, byteorder='big'))
+
+    #return bytes(bitswapped)
+
+    bitswapped = data_block
+    # now swap byte order big endian to little endian within a 32-bit block
+    wordswapped = bytearray()
+    i = 0
+    while i < len(bitswapped):
+        word = bitswapped[i:i + 4]
+        wordswapped.extend(word[::-1])
+        i = i + 4
+
+    return bytes(wordswapped)
+
 
 """
 Throw-away function used to discover the swizzle above
@@ -171,7 +195,7 @@ def main():
     ifile = args.file
     ofilename = args.output_file
 
-
+    ### reconstrution of the plaintext header
     hmac = int(1).to_bytes(32, byteorder='big')
     print("hmac: ", binascii.hexlify((hmac)))
     hmac_swizzle = xilinx_swizzle(hmac)
@@ -194,23 +218,40 @@ def main():
     footer = bytes(footer)
     print("hmac_footer: ", binascii.hexlify(footer))
 
-    # this is the number appended to the bitstream, looks like a SHA384 sum, not a SHA256 sum
-    big_hmac = int(0xfc59d3235884391b0ec66b850e668087273368153ec3d8ef68b25fbcaf7547ede55c95fa2940200cc4ec9c6d76aa8d67).to_bytes(48, byteorder='big')
+
+    ### figuring out the HMAC.
+    # this is the plaintext number appended to the bitstream for a MAC key of "1"
+    big_hmac = int(0xfc59d3235884391b0ec66b850e668087273368153ec3d8ef68b25fbcaf7547ed).to_bytes(32, byteorder='big')
     print("big_hmac: ", binascii.hexlify((big_hmac)))
     print("big_hmac_swizzle: ", binascii.hexlify(xilinx_swizzle(big_hmac)))
+    big_hmac = int(0xFDAC4413D5A6FAEF517088C5549A4B752A2C6C1D8F32561EA6060F529EBA2CEF).to_bytes(32, byteorder='big')
+    print("big_hmac_cipher: ", binascii.hexlify((big_hmac)))
+    print("big_hmac_cipher_swizzle: ", binascii.hexlify(xilinx_swizzle(big_hmac)))
 
+    # note that the input length is exactly a multiple of 64 bytes or 512 bits
+    # which means there is no need to pad the last block of the SHA-256 message
     with open("decrypt-hmac1-t1.bin", 'rb') as hfile:
         msg = hfile.read()
-        h = SHA384.new()
-        h.update(msg)
+        if (len(msg) % 64) != 0:
+            print("Note: file being tried is not an even block length size")
+        h = SHA256.new()
+        as_blocks = False  # convinced myself that block-lengths updates don't matter (as they shouldn't)
+        if as_blocks:
+            k = 0
+            while k < len(msg) - 128: #just trying to see what happens if we lop off some of the trailing gunk
+                h.update(msg[k:k+16])
+                k = k + 16
+        else:
+            h.update(hmac_format(msg))
         digest = h.digest()
         print("digest: ", binascii.hexlify(digest))
         print("digest_swizzle: ", binascii.hexlify(xilinx_swizzle(digest)))
-
+    # this is the ciphertext version of the hash -- just in case they didn't try to encrypt it??
+    # 0xFDAC4413D5A6FAEF517088C5549A4B752A2C6C1D8F32561EA6060F529EBA2CEF
 
     exit(0)
 
-
+    ### figuring out the AES bit order
     for i in range(0, 1): # wrapped in an iterator, i can be used to brute-force offsets and other parameters
         #key = 0xB000000000000000000000000000000000000000000000000000000000000003
         #key_bytes = long_to_bytes(key)

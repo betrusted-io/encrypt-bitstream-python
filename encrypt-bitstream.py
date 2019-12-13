@@ -2,6 +2,7 @@
 
 import argparse
 from Crypto.Cipher import AES
+from Crypto.Hash import SHA384, SHA256
 
 from binascii import unhexlify
 from Crypto.Util.Padding import unpad, pad
@@ -15,6 +16,8 @@ Let's assume we are working with a .bin format, which
 lacks the informative header on the .bit file (and is the
 type that is burned into the ROM anyways).
 
+# The basic bit swizzle
+
 The ciphertext starts at byte 184. To decrypt:
 
 * bit-reverse each byte ([7:0] -> [0:7] on each byte)
@@ -23,16 +26,60 @@ The ciphertext starts at byte 184. To decrypt:
 
 So, to encrypt:
 * feed bitstream into AES
-* byte-verse each 32-bit word
+* byte-reverse each 32-bit word
 * bit reverse each byte
 
 This is validate with key=0, IV=0.
 
+# The HMAC
+
+The HMAC key is written into the bitstream as follows:
+
+Two copies of the HMAC key are stored, once in the header, once in the footer.
+
+Prepare the header:
+
+* byte-reverse each 32-bit word of the HMAC key
+* bit-reverse each byte
+* XOR each byte with 0x6C
+* pad an additional 32 bytes of 0x6C
+* pre-pend to bitstream
+
+Total header length is 64 bytes.
+
+Prepare the footer:
+
+* byte-reverse each 32-bit word of the HMAC key
+* bit-reverse each byte
+* XOR each byte with 0x3A
+* pad an additional 32 bytes of 0x3A
+* append the following 64 bytes:
+
+0000 0000 0000 0000 0000 0000 0000 0000
+0000 0000 0000 0000 0000 0000 0000 0000
+0000 0001 0000 0000 0000 0000 0000 0000
+0000 0000 0000 0000 0000 0000 00c0 0000
+
+At this point, it looks like an HMAC that is a SHA-384 hash is appended to
+the message. However, we have not been able to get a computed hash to line 
+up with the decrypted value output at the bottom of the file, so there
+is likely some additional trick to how the decrypted bitstream is fed into
+the HMAC algorithm. 
+ 
+Once prepared, this entire set is encrypted using AES-CBC.
+
+Note that the number 0x085b98 is immediately before the cipherext data (this is for
+the 35T), and this corresponds to 547,736 words or 2,190,944 bytes. This is curious
+because the length with HMAC code is 2,190,960, or 16 bytes longer than the total
+data length if the HMAC were a SHA-384. It would make sense for a SHA-256, but then
+what are the extra 16 bytes at the end for?
+
+
 Todo:
 * Figure out key byte order (mapping of eFuse bit order-to-AES)
 * Figure out IV byte order (presume it also has same bit re-ordering rules, but check)
-* Figure out HMAC protocol. Docs say SHA-256, but the role of the "HMAC key" as well
-  as exactly which regions are hashed and exactly how the hash is stored is unclear.
+* Figure out HMAC protocol. Docs say SHA-256, but exactly which regions are hashed and 
+  if it's actually this hash is unclear (the data would fit a SHA-384 hash much better)
 
 """
 
@@ -123,6 +170,46 @@ def main():
 
     ifile = args.file
     ofilename = args.output_file
+
+
+    hmac = int(1).to_bytes(32, byteorder='big')
+    print("hmac: ", binascii.hexlify((hmac)))
+    hmac_swizzle = xilinx_swizzle(hmac)
+    print("hmac_swizzle: ", binascii.hexlify((hmac_swizzle)))
+
+    scramble_header = int(0x6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C).to_bytes(32, byteorder='big')
+    print("scramble: ", binascii.hexlify((scramble_header)))
+    header = bytearray()
+    for i in range(0, 32):
+        header.extend((hmac_swizzle[i] ^ scramble_header[i]).to_bytes(1, byteorder='big'))
+    header = bytes(header)
+    print("hmac_header: ", binascii.hexlify(header))
+
+    scramble_footer = int(0x3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A).to_bytes(32, byteorder='big')
+    print("scramble: ", binascii.hexlify((scramble_footer)))
+    footer = bytearray()
+    for i in range(0, 32):
+        footer.extend((hmac_swizzle[i] ^ scramble_footer[i]).to_bytes(1, byteorder='big'))
+
+    footer = bytes(footer)
+    print("hmac_footer: ", binascii.hexlify(footer))
+
+    # this is the number appended to the bitstream, looks like a SHA384 sum, not a SHA256 sum
+    big_hmac = int(0xfc59d3235884391b0ec66b850e668087273368153ec3d8ef68b25fbcaf7547ede55c95fa2940200cc4ec9c6d76aa8d67).to_bytes(48, byteorder='big')
+    print("big_hmac: ", binascii.hexlify((big_hmac)))
+    print("big_hmac_swizzle: ", binascii.hexlify(xilinx_swizzle(big_hmac)))
+
+    with open("decrypt-hmac1-t1.bin", 'rb') as hfile:
+        msg = hfile.read()
+        h = SHA384.new()
+        h.update(msg)
+        digest = h.digest()
+        print("digest: ", binascii.hexlify(digest))
+        print("digest_swizzle: ", binascii.hexlify(xilinx_swizzle(digest)))
+
+
+    exit(0)
+
 
     for i in range(0, 1): # wrapped in an iterator, i can be used to brute-force offsets and other parameters
         #key = 0xB000000000000000000000000000000000000000000000000000000000000003

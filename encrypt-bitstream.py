@@ -7,6 +7,8 @@ from Crypto.Hash import SHA384, SHA256
 from binascii import unhexlify
 from Crypto.Util.Padding import unpad, pad
 
+from math import log2
+
 import binascii
 
 """
@@ -16,18 +18,18 @@ Let's assume we are working with a .bin format, which
 lacks the informative header on the .bit file (and is the
 type that is burned into the ROM anyways).
 
-# The basic bit swizzle
+# Decryption
 
 The ciphertext starts at byte 184. To decrypt:
 
-* bit-reverse each byte ([7:0] -> [0:7] on each byte)
-* byte-reverse each 32-bit word ([ABCD] -> [DCBA])
-* feed into AES
+* divide into 32-bit chunks
+* reverse the order of the bits in each 32-bit chunk
+* feed into AES in big-endian order
 
 So, to encrypt:
-* feed bitstream into AES
-* byte-reverse each 32-bit word
-* bit reverse each byte
+* feed bitstream into AES blocks in big-endian order
+* reverse the order of bits in each 32-bit chunk
+* write out in big endian format. This is referred to "as-stored" format.
 
 This is validate with key=0, IV=0.
 
@@ -39,32 +41,50 @@ Two copies of the HMAC key are stored, once in the header, once in the footer.
 
 Prepare the header:
 
-* byte-reverse each 32-bit word of the HMAC key
-* bit-reverse each byte
+* flip the order of bits in every 32-bit chunk of the HMAC key
 * XOR each byte with 0x6C
 * pad an additional 32 bytes of 0x6C
 * pre-pend to bitstream
 
 Total header length is 64 bytes.
 
-Prepare the footer:
+Determine the last command in the bitstream:
 
-* byte-reverse each 32-bit word of the HMAC key
-* bit-reverse each byte
+This is probably the last instance of "00 00 00 04" in the as-stored bitstream. 
+You'll know you found it because when looking at a decrypt bitstream, immediately 
+after this you will see a SHA-256 padding (1 followed by many 0's then the 
+length of the message; note the order that comes out of AES has to be 
+bit-flipped for this pattern to be obvious, when staring at the as-stored bitstream
+it's not totally obvious).
+
+The padding looks something like this as-stored:
+
+        v the '1' bit per SHA requirement, but bit-flipped
+0000 0001 0000 0000 0000 0000 0000 0000
+0000 0000 0000 0000 0000 0000 0026 d080
+                               ^ length of message in bits
+
+Compute hash of the bitstream from the very first byte of the header
+to the end of the active bitstream + SHA padding. Call this "hash1". 
+
+Append an additional 256 bytes of 0's after the end of the padding that was
+required to compute hash1. 
+
+Now, prepare the footer:
+
+* flip the order of bits in every 32-bit chunk of the HMAC key
 * XOR each byte with 0x3A
 * pad an additional 32 bytes of 0x3A
-* append the following 64 bytes:
+* append hash1
 
-0000 0000 0000 0000 0000 0000 0000 0000
-0000 0000 0000 0000 0000 0000 0000 0000
-0000 0001 0000 0000 0000 0000 0000 0000
-0000 0000 0000 0000 0000 0000 00c0 0000
+Now, compute a hash of the region spanning from the beginning of
+the footer (not including the 0 pad, so starting at the 0x3A sequence)
+to the end of hash1. This means first padding the region, and then 
+computing the hash. 
 
-At this point, it looks like an HMAC that is a SHA-256 hash is appended to
-the message. However, we have not been able to get a computed hash to line 
-up with the decrypted value output at the bottom of the file, so there
-is likely some additional trick to how the decrypted bitstream is fed into
-the HMAC algorithm. 
+Bit-flip and append this hash to the overall file, and you have now 
+an HMAC-ready bitstream. Note that the Xilinx implementation 0's out
+the copy of "hash1" as stored in the bitstream. 
  
 Once prepared, this entire set is encrypted using AES-CBC.
 
@@ -77,110 +97,73 @@ An extra 16-bytes of random-looking data appears after this length when you
 "over-decrypt" because the repeating output of the CBC cipher doesn't start until 
 one block after the last block.
 
-
 Todo:
 * Figure out key byte order (mapping of eFuse bit order-to-AES)
 * Figure out IV byte order (presume it also has same bit re-ordering rules, but check)
-* Figure out how the SHA-256 HMAC is applied to the bitstream.
+
+Bitstream footer notes:
+
+00216d90: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00216da0: 0000 0000 0000 0000 0000 0000 0000 0000  ................
+00216db0: 0000 0000 0000 0000 0000 0000 0000 0000  ................  <-- end of	FPGA bitstream
+00216dc0: 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a  :::::::::::::::: |  | <-- hmac key xor with 0x3a
+00216dd0: 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a  :::::::::::::::: |  |
+00216de0: 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a  :::::::::::::::: |  |
+00216df0: 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a 3a3a  :::::::::::::::: |  |
+00216e00: 0000 0000 0000 0000 0000 0000 0000 0000  HMAC1........... |  | <-- where hmac digest #1 was: SHA256(bitstream)
+00216e10: 0000 0000 0000 0000 0000 0000 0000 0000  .......was here. |  |____ 96 bytes = 0x300 bits = 0x00C0_0000 bit-reversed
+00216e20: 0000 0001 0000 0000 0000 0000 0000 0000  ................ |    <-- padding for hmac digest #1
+00216e30: 0000 0000 0000 0000 0000 0000 00c0 0000  ................ |_______ region hashed for hmac digest #2
+00216e40: ae61 607f f1ea 2364 5223 bb1b b7b6 069b  .a`...#dR#...... <--	hmac digest #2:	SHA256( (hmackey^0x3a | SHA256(bitstream) | SHA_pad) )
+00216e50: 2a48 b7f5 dd28 87e0 e10d 3fd0 66e7 cd15  *H...(....?.f...
+
+For some reason, hmac digest #1	area is	zeroed out after its computation?
 
 """
 
 """
-This is the Xilinx bit-swizzle function
+Reverse the order of bits in a word that is bitwidth bits wide
 """
-def xilinx_swizzle(data_block):
-    # swap all bits MSB-to-LSB in an 8-bit block
+def bitflip(data_block, bitwidth=32):
+    if bitwidth == 0:
+        return data_block
+
+    bytewidth = bitwidth // 8
     bitswapped = bytearray()
-    for byte in data_block:
-        # print(format(byte, '02x'))
-        bitswapped.extend(int('{:08b}'.format(byte)[::-1], 2).to_bytes(1, byteorder='big'))
 
-    # now swap byte order big endian to little endian within a 32-bit block
-    wordswapped = bytearray()
     i = 0
-    while i < len(bitswapped):
-        word = bitswapped[i:i + 4]
-        wordswapped.extend(word[::-1])
-        i = i + 4
+    while i < len(data_block):
+        data = int.from_bytes(data_block[i:i+bytewidth], byteorder='big', signed=False)
+        b = '{:0{width}b}'.format(data, width=bitwidth)
+        bitswapped.extend(int(b[::-1], 2).to_bytes(bytewidth, byteorder='big'))
+        i = i + bytewidth
 
-    return bytes(wordswapped)
+    return bytes(bitswapped)
 
+def byteflip(data, bytewidth=4):
+    if bytewidth == 0:
+        return data
 
-def hmac_format(data_block):
-    # swap all bits MSB-to-LSB in an 8-bit block
-    #bitswapped = bytearray()
-    #for byte in data_block:
-        # print(format(byte, '02x'))
-    #    bitswapped.extend(int('{:08b}'.format(byte)[::-1], 2).to_bytes(1, byteorder='big'))
-
-    #return bytes(bitswapped)
-
-    bitswapped = data_block
-    # now swap byte order big endian to little endian within a 32-bit block
-    wordswapped = bytearray()
+    byteswapped = bytearray()
     i = 0
-    while i < len(bitswapped):
-        word = bitswapped[i:i + 4]
-        wordswapped.extend(word[::-1])
-        i = i + 4
+    while i < len(data):
+        b = int.from_bytes(data[i:i+bytewidth], byteorder='big', signed=False)
+        byteswapped.extend(b.to_bytes(bytewidth, byteorder='little'))
+        i = i + bytewidth
 
-    return bytes(wordswapped)
+    return bytes(byteswapped)
 
 
-"""
-Throw-away function used to discover the swizzle above
-"""
-def long_to_bytes (val, endianness='big', bitswap=False, wordswap=False):
-    """
-    Use :ref:`string formatting` and :func:`~binascii.unhexlify` to
-    convert ``val``, a :func:`long`, to a byte :func:`str`.
+# assumes a, b are the same length eh?
+def xor_bytes(a, b):
+    i = 0
+    y = bytearray()
+    while i < len(a):
+        y.extend((a[i] ^ b[i]).to_bytes(1, byteorder='little'))
+        i = i + 1
 
-    :param long val: The value to pack
+    return bytes(y)
 
-    :param str endianness: The endianness of the result. ``'big'`` for
-      big-endian, ``'little'`` for little-endian.
-
-    If you want byte- and word-ordering to differ, you're on your own.
-
-    Using :ref:`string formatting` lets us use Python's C innards.
-    """
-
-    # one (1) hex digit per four (4) bits
-    width = val.bit_length()
-
-    # unhexlify wants an even multiple of eight (8) bits, but we don't
-    # want more digits than we need (hence the ternary-ish 'or')
-    width += 8 - ((width % 8) or 8)
-
-    # format width specifier: four (4) bits per hex digit
-    fmt = '%%0%dx' % (width // 4)
-
-    # prepend zero (0) to the width, to zero-pad the output
-    s = unhexlify(fmt % val)
-
-    if endianness == 'little':
-        # see http://stackoverflow.com/a/931095/309233
-        s = s[::-1]
-
-    if bitswap:
-        swapped = bytearray()
-        for byte in s:
-            #print(format(byte, '02x'))
-            swapped.extend( int('{:08b}'.format(byte)[::-1], 2).to_bytes(1, byteorder='big') )
-
-        s = swapped
-
-    if wordswap:
-        swapped = bytearray()
-        i = 0
-        while i < len(s):
-            word = s[i:i+4]
-            swapped.extend(word[::-1])
-            i = i+4
-
-        s = swapped
-
-    return s
 
 def main():
     parser = argparse.ArgumentParser(description="Encrypt bitstream")
@@ -188,139 +171,118 @@ def main():
         "-f", "--file", required=True, help="filename to process", type=str
     )
     parser.add_argument(
-        "-o", "--output-file", required=True, help="output filename", type=str
+        "-o", "--output-file", help="output filename", type=str
+    )
+    parser.add_argument(
+        "-d", "--decrypt", default=False, action='store_true'
+    )
+    parser.add_argument(
+        "-s", "--simulate", default=False, action='store_true', help="Decrypt reference file & simulate hashes"
     )
     args = parser.parse_args()
 
     ifile = args.file
-    ofilename = args.output_file
 
-    ### reconstrution of the plaintext header
-    hmac = int(1).to_bytes(32, byteorder='big')
-    print("hmac: ", binascii.hexlify((hmac)))
-    hmac_swizzle = xilinx_swizzle(hmac)
-    print("hmac_swizzle: ", binascii.hexlify((hmac_swizzle)))
+    if args.decrypt:
+        ### figuring out the AES bit order
+        for i in range(0, 1):  # wrapped in an iterator, i can be used to brute-force offsets and other parameters
+            # initially experimenting with 0-key TODO: figure out key bit order
+            key_bytes = bytes(32)
+            print("key: ", binascii.hexlify(key_bytes), "length: ", str(len(key_bytes) * 8))
 
-    scramble_header = int(0x6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C).to_bytes(32, byteorder='big')
-    print("scramble: ", binascii.hexlify((scramble_header)))
-    header = bytearray()
-    for i in range(0, 32):
-        header.extend((hmac_swizzle[i] ^ scramble_header[i]).to_bytes(1, byteorder='big'))
-    header = bytes(header)
-    print("hmac_header: ", binascii.hexlify(header))
+            # initially experimenting with 0-IV TODO: figure out IV bit order
+            iv_bytes = bytes(16)
+            print("iv: ", binascii.hexlify(iv_bytes))
+            cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
+            print("block size: ", str(AES.block_size))
 
-    scramble_footer = int(0x3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A).to_bytes(32, byteorder='big')
-    print("scramble: ", binascii.hexlify((scramble_footer)))
-    footer = bytearray()
-    for i in range(0, 32):
-        footer.extend((hmac_swizzle[i] ^ scramble_footer[i]).to_bytes(1, byteorder='big'))
+            with open(ifile, "rb") as f:
+                bitfile = f.read()
 
-    footer = bytes(footer)
-    print("hmac_footer: ", binascii.hexlify(footer))
+            ofilename = args.output_file
+            with open(ofilename, "wb") as ofile:
 
+                active_area = bitfile[184 + i:]
+                pos = 0
 
-    ### figuring out the HMAC.
-    # this is the plaintext number appended to the bitstream for a MAC key of "1"
-    big_hmac = int(0xfc59d3235884391b0ec66b850e668087273368153ec3d8ef68b25fbcaf7547ed).to_bytes(32, byteorder='big')
-    print("big_hmac: ", binascii.hexlify((big_hmac)))
-    print("big_hmac_swizzle: ", binascii.hexlify(xilinx_swizzle(big_hmac)))
-    big_hmac = int(0xFDAC4413D5A6FAEF517088C5549A4B752A2C6C1D8F32561EA6060F529EBA2CEF).to_bytes(32, byteorder='big')
-    print("big_hmac_cipher: ", binascii.hexlify((big_hmac)))
-    print("big_hmac_cipher_swizzle: ", binascii.hexlify(xilinx_swizzle(big_hmac)))
+                # to check the first few blocks, change this to pos < 256, and uncomment the prints
+                while pos < len(active_area):
+                    data_block = active_area[pos:pos + 16]
+                    pos = pos + 16
 
-    # note that the input length is exactly a multiple of 64 bytes or 512 bits
-    # which means there is no need to pad the last block of the SHA-256 message
-    with open("decrypt-hmac1-t1.bin", 'rb') as hfile:
-        msg = hfile.read()
-        if (len(msg) % 64) != 0:
-            print("Note: file being tried is not an even block length size")
-        h = SHA256.new()
-        as_blocks = False  # convinced myself that block-lengths updates don't matter (as they shouldn't)
-        if as_blocks:
-            k = 0
-            while k < len(msg) - 128: #just trying to see what happens if we lop off some of the trailing gunk
-                h.update(msg[k:k+16])
-                k = k + 16
-        else:
-            h.update(hmac_format(msg))
-        digest = h.digest()
-        print("digest: ", binascii.hexlify(digest))
-        print("digest_swizzle: ", binascii.hexlify(xilinx_swizzle(digest)))
-    # this is the ciphertext version of the hash -- just in case they didn't try to encrypt it??
-    # 0xFDAC4413D5A6FAEF517088C5549A4B752A2C6C1D8F32561EA6060F529EBA2CEF
+                    db_bytes = bitflip(data_block)
 
-    exit(0)
+                    # print("ciphertext: ", str(binascii.hexlify(db_bytes)))
+                    plain = cipher.decrypt(db_bytes)
 
-    ### figuring out the AES bit order
-    for i in range(0, 1): # wrapped in an iterator, i can be used to brute-force offsets and other parameters
-        #key = 0xB000000000000000000000000000000000000000000000000000000000000003
-        #key_bytes = long_to_bytes(key)
+                    finalout = bytearray()
+                    for b in plain:
+                        c = b ^ 0x0  # no actual confounder
+                        finalout.extend(c.to_bytes(1, byteorder='little'))
+
+                    # print("plaintext: ", binascii.hexlify(finalout))
+                    ofile.write(finalout)
+
+            # function may exit with a padding error, that's OK for now as we haven't yet determined
+            # the actual length of the bitstream yet...
+
+    # this subroutine decrypts a 0-key, 0-IV bitstream and then uses the decrypted data to
+    # compute the HMAC result from scratch
+    elif args.simulate:
+        # first setup the key. for now, we use the "0" key, as we haven't figured out the byte
+        # ordering for the key format
         key_bytes = bytes(32)
         print("key: ", binascii.hexlify(key_bytes), "length: ", str(len(key_bytes) * 8))
 
-        # iv_bytes = long_to_bytes(0x63734739209ac700298ff54ebb01a943)
-        #iv_bytes = xilinx_swizzle(long_to_bytes(0x0c7c1ee30b4645469ff7c797d903fab3))
+        # also start with the zero IV as that format hasn't been figured out yet
         iv_bytes = bytes(16)
         print("iv: ", binascii.hexlify(iv_bytes))
         cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
-        print("block size: ", str(AES.block_size))
-
-        # this is a really simple example that works
-        # data_block =  0xd14f37c53d649c6ce3a03cb7886a5d5e
-        # print( "ciphertext (before swap): ", format(data_block, '016x'))
-        # db_bytes = bytes(long_to_bytes(data_block, 'big', True, True))
-        # print("ciphertext: ", str(binascii.hexlify(db_bytes)))
-        # plain = cipher.decrypt(db_bytes)
-        # print("plaintext: ", binascii.hexlify(plain))
 
         with open(ifile, "rb") as f:
-            bitfile = f.read()
+            binfile = f.read()
 
-        with open(ofilename, "wb") as ofile:
+            ciphertext_len = 4* int.from_bytes(binfile[180:184], 'big')
 
-            active_area = bitfile[184+i:]
-            pos = 0
+            active_area = binfile[184:184 + ciphertext_len]
 
-            # to check the first few blocks, change this to pos < 256, and uncomment the prints
-            while pos <  len(active_area):
-                data_block = active_area[pos:pos+16]
-                pos = pos + 16
+            plain = cipher.decrypt(bitflip(active_area))
 
-                db_bytes = xilinx_swizzle(data_block)
+            # now take plain and compute the hashes
+            hash_len = ciphertext_len - 0x1E0
+            print("hash_len: ", hash_len)
+            h1 = SHA256.new()
+            k = 0
+            while k < hash_len:
+                h1.update(bitflip(plain[k:k+16], 32))
+                k = k + 16
 
-                #print("ciphertext: ", str(binascii.hexlify(db_bytes)))
-                plain = cipher.decrypt(db_bytes)
+            print("plain top: ", binascii.hexlify(plain[:64]))
+            print("plain bottom: ", binascii.hexlify(plain[hash_len-64:hash_len]))
+            h1_digest = h1.digest()
 
-                finalout = bytearray()
-                for b in plain:
-                    c = b ^ 0x0 # no actual confounder
-                    finalout.extend(c.to_bytes(1, byteorder='little'))
+            print("digest1 (in stored order): ", binascii.hexlify(bitflip(h1_digest)))
+            print("(this digest is zeroed in the bitstream)")
 
-                #print("plaintext: ", binascii.hexlify(finalout))
-                ofile.write(finalout)
+            h2 = SHA256.new()
+            footer = int(0x3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A).to_bytes(32, byteorder='big')
+            hmac_key = bitflip(int(1).to_bytes(32, byteorder='big'))
+            keyed_footer = xor_bytes(footer, hmac_key)
+            print('keyed_footer: ', binascii.hexlify(keyed_footer))
+            h2.update(bitflip(keyed_footer))
+            print('footer: ', binascii.hexlify(footer))
+            h2.update(bitflip(footer))
+            print('digest: ', binascii.hexlify(bitflip(h1_digest)))
+            h2.update(h1_digest)
+            h2_digest = h2.digest()
+            print("digest2: ", binascii.hexlify(h2_digest))
+            print("final digest2 (in stored order): ", binascii.hexlify(bitflip(h2_digest)))
 
+            print("hmac as found in file (should match above): ", binascii.hexlify(plain[ciphertext_len-32:]))
+            exit(0)
 
-        # function may exit with a padding error, that's OK for now as we haven't yet determined
-        # the actual length of the bitstream yet...
-
-"""
-        with open(ifile, "rb") as f:
-            bitfile = f.read()
-
-        active_area = bitfile[184+i:]
-        #print("active area:")
-        #print(binascii.hexlify((active_area[:128])))
-        active_pad = pad(active_area, AES.block_size)
-
-        print("active padded:")
-        print(binascii.hexlify((active_pad[:128])))
-        plainbit = cipher.decrypt(active_pad)
-
-        print("plainbit:")
-        print(binascii.hexlify(plainbit[:128]))
-        #pp = pprint.PrettyPrinter(indent=4)
-        #pp.pprint(plainbit[272:1024])
-"""
+    else:
+        print("no command specified, exiting")
 
 
 if __name__ == "__main__":

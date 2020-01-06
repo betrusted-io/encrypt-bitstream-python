@@ -2,21 +2,24 @@
 
 import argparse
 from Crypto.Cipher import AES
-from Crypto.Hash import SHA384, SHA256
-
-from binascii import unhexlify
-from Crypto.Util.Padding import unpad, pad
-
-from math import log2
+from Crypto.Hash import SHA256
+from Crypto.Random import get_random_bytes
 
 import binascii
+import logging
+import sys
 
 """
-Figuring out the bitstream encryption format.
+Encrypting a 7-series bitstream.
 
-Let's assume we are working with a .bin format, which
-lacks the informative header on the .bit file (and is the
-type that is burned into the ROM anyways).
+Encrypted bitstreams have a slightly different structure than
+normal bitstreams, so to simplify things, we start from a bitstream
+that is "encrypted" with a dummy key. We then decrypt this stream
+and re-encrypt it to the key of choice; by doing this, we can just
+update the file with minimal editing. 
+
+We working with a .bin format, which lacks the informative header 
+on the .bit file (and is the type that is burned into the ROM anyways).
 
 # Decryption
 
@@ -97,10 +100,6 @@ An extra 16-bytes of random-looking data appears after this length when you
 "over-decrypt" because the repeating output of the CBC cipher doesn't start until 
 one block after the last block.
 
-Todo:
-* Figure out key byte order (mapping of eFuse bit order-to-AES)
-* Figure out IV byte order (presume it also has same bit re-ordering rules, but check)
-
 Bitstream footer notes:
 
 00216d90: 0000 0000 0000 0000 0000 0000 0000 0000  ................
@@ -121,6 +120,38 @@ For some reason, hmac digest #1	area is	zeroed out after its computation?
 
 """
 
+# This is a fixed header for the bitstream, contains sync patterns and configures options such
+# as the bitwidth of the config, voltage, etc. This one configures 66MHz config speed, x1, 1.8V
+bitstream_header_x1 = [
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0x00, 0x00, 0x00, 0xbb, 0x11, 0x22, 0x00, 0x44, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0xaa, 0x99, 0x55, 0x66, 0x20, 0x00, 0x00, 0x00, 0x30, 0x03, 0xe0, 0x01, 0x00, 0x00, 0x00, 0x0b,
+0x30, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x12, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0xc0, 0x01,
+0x80, 0x00, 0x00, 0x40, 0x30, 0x00, 0xa0, 0x01, 0x80, 0x00, 0x00, 0x40, 0x30, 0x01, 0xc0, 0x01,
+0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x01, 0x60, 0x04,
+]
+# this one selects 66MHz config speed, x2, 1.8V, encryption on, with key from efuse
+bitstream_header_x2 = [
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0x00, 0x00, 0x00, 0xbb, 0x11, 0x22, 0x00, 0x44, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+0xaa, 0x99, 0x55, 0x66, 0x20, 0x00, 0x00, 0x00, 0x30, 0x03, 0xe0, 0x01, 0x00, 0x00, 0x01, 0x3b,
+0x30, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x12, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0xc0, 0x01,
+0x80, 0x00, 0x00, 0x40, 0x30, 0x00, 0xa0, 0x01, 0x80, 0x00, 0x00, 0x40, 0x30, 0x01, 0xc0, 0x01,
+0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x01, 0x60, 0x04,
+]
+# then IV key is here 16 bytes
+ciphertext_header = [
+0x30, 0x03, 0x40, 0x01, 0x00, 0x08, 0x5b, 0x98,
+]
+
 """
 Reverse the order of bits in a word that is bitwidth bits wide
 """
@@ -140,20 +171,6 @@ def bitflip(data_block, bitwidth=32):
 
     return bytes(bitswapped)
 
-def byteflip(data, bytewidth=4):
-    if bytewidth == 0:
-        return data
-
-    byteswapped = bytearray()
-    i = 0
-    while i < len(data):
-        b = int.from_bytes(data[i:i+bytewidth], byteorder='big', signed=False)
-        byteswapped.extend(b.to_bytes(bytewidth, byteorder='little'))
-        i = i + bytewidth
-
-    return bytes(byteswapped)
-
-
 # assumes a, b are the same length eh?
 def xor_bytes(a, b):
     i = 0
@@ -166,123 +183,161 @@ def xor_bytes(a, b):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Encrypt bitstream")
+    parser = argparse.ArgumentParser(description="Re-encrypt 7-series bitstream with a new key")
     parser.add_argument(
-        "-f", "--file", required=True, help="filename to process", type=str
+        "-f", "--file", required=True, help="Root filename for input file. Expects .bin and .nky extensions.", type=str
     )
     parser.add_argument(
-        "-o", "--output-file", help="output filename", type=str
+        "-k", "--key", required=True, help="Root filename of new key to encrypt to. Expects .nky suffix.", type=str
     )
     parser.add_argument(
-        "-d", "--decrypt", default=False, action='store_true'
+        "-o", "--output-file", help="output filename root. Generates .bin and .nky files", type=str
     )
     parser.add_argument(
-        "-s", "--simulate", default=False, action='store_true', help="Decrypt reference file & simulate hashes"
+        "-d", "--debug", help="turn on debugging spew", default=False, action="store_true"
     )
     args = parser.parse_args()
 
     ifile = args.file
+    ofile = args.output_file
+    keyfile = args.key
 
-    if args.decrypt:
-        ### figuring out the AES bit order
-        for i in range(0, 1):  # wrapped in an iterator, i can be used to brute-force offsets and other parameters
-            # initially experimenting with 0-key TODO: figure out key bit order
-            key_bytes = bytes(32)
-            print("key: ", binascii.hexlify(key_bytes), "length: ", str(len(key_bytes) * 8))
+    if args.debug:
+        logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
-            # initially experimenting with 0-IV TODO: figure out IV bit order
-            iv_bytes = bytes(16)
-            print("iv: ", binascii.hexlify(iv_bytes))
-            cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
-            print("block size: ", str(AES.block_size))
+    # extract the original key, HMAC, and IV
+    with open(ifile + ".nky", "r") as nky:
+        for lines in nky:
+            line = lines.split(' ')
+            if line[1] == '0':
+                nky_key = line[2].rstrip().rstrip(';')
+            if line[1] == 'StartCBC':
+                nky_iv = line[2].rstrip().rstrip(';')
+            if line[1] == 'HMAC':
+                nky_hmac = line[2].rstrip().rstrip(';')
 
-            with open(ifile, "rb") as f:
-                bitfile = f.read()
+    logging.debug("original key: %s", nky_key)
+    logging.debug("original iv:   %s", nky_iv)
+    logging.debug("original hmac: %s", nky_hmac)
 
-            ofilename = args.output_file
-            with open(ofilename, "wb") as ofile:
+    with open(keyfile + ".nky", "r") as nky:
+        for lines in nky:
+            line = lines.split(' ')
+            if line[1] == '0':
+                new_key = line[2].rstrip().rstrip(';')
 
-                active_area = bitfile[184 + i:]
-                pos = 0
+    # always re-key the IV and HMAC every time the program is run
+    new_iv = get_random_bytes(16)
+    new_hmac = get_random_bytes(32)
 
-                # to check the first few blocks, change this to pos < 256, and uncomment the prints
-                while pos < len(active_area):
-                    data_block = active_area[pos:pos + 16]
-                    pos = pos + 16
+    # format a .nky for the output .bin
+    with open(ofile + ".nky", "w") as newkey:
+        newkey.write("Device xc7s50;\n")
+        newkey.write("Key 0 ")
+        newkey.write(new_key)
+        newkey.write(";\n")
+        newkey.write("Key StartCBC ")
+        newkey.write(str(binascii.hexlify(bitflip(new_iv))).strip("b").strip("'"))
+        newkey.write(";\n")
+        newkey.write("Key HMAC ")
+        newkey.write(str(binascii.hexlify(bitflip(new_hmac))).strip("b").strip("'"))
+        newkey.write(";\n")
 
-                    db_bytes = bitflip(data_block)
+    key_bytes = int(nky_key, 16).to_bytes(32, byteorder='big')
+    logging.debug("old key: %s", binascii.hexlify(key_bytes))
 
-                    # print("ciphertext: ", str(binascii.hexlify(db_bytes)))
-                    plain = cipher.decrypt(db_bytes)
+    # open the input file, and recover the plaintext
+    with open(ifile + ".bin", "rb") as f:
+        binfile = f.read()
 
-                    finalout = bytearray()
-                    for b in plain:
-                        c = b ^ 0x0  # no actual confounder
-                        finalout.extend(c.to_bytes(1, byteorder='little'))
+        ciphertext_len = 4* int.from_bytes(binfile[180:184], 'big')
+        logging.debug("ciphertext len: %d", ciphertext_len)
 
-                    # print("plaintext: ", binascii.hexlify(finalout))
-                    ofile.write(finalout)
+        active_area = binfile[184:184 + ciphertext_len]
 
-            # function may exit with a padding error, that's OK for now as we haven't yet determined
-            # the actual length of the bitstream yet...
+        iv_bytes = bitflip(binfile[0xa0:0xb0])  # note that the IV is embedded in the file
+        logging.debug("recovered iv: %s", binascii.hexlify(iv_bytes))
 
-    # this subroutine decrypts a 0-key, 0-IV bitstream and then uses the decrypted data to
-    # compute the HMAC result from scratch
-    elif args.simulate:
-        # first setup the key. for now, we use the "0" key, as we haven't figured out the byte
-        # ordering for the key format
-        key_bytes = bytes(32)
-        print("key: ", binascii.hexlify(key_bytes), "length: ", str(len(key_bytes) * 8))
-
-        # also start with the zero IV as that format hasn't been figured out yet
-        iv_bytes = bytes(16)
-        print("iv: ", binascii.hexlify(iv_bytes))
         cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
+        plain_bitstream = cipher.decrypt(bitflip(active_area))
 
-        with open(ifile, "rb") as f:
-            binfile = f.read()
+    # now construct the output file and its hashes
+    global bitstream_header_x1
+    plaintext = bytearray()
+    with open(ofile + ".bin", "wb") as f:
+        for item in bitstream_header_x1:  # add the cleartext header
+            f.write(bytes([item]))
 
-            ciphertext_len = 4* int.from_bytes(binfile[180:184], 'big')
+        f.write(bitflip(new_iv)) # insert the IV
 
-            active_area = binfile[184:184 + ciphertext_len]
+        for item in ciphertext_header:  # add the cleartext length-of-ciphertext field before the ciphertext
+            f.write(bytes([item]))
 
-            plain = cipher.decrypt(bitflip(active_area))
+        # generate the header and footer hash keys.
+        header = int(0x6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C6C).to_bytes(32, byteorder='big')
+        keyed_header = xor_bytes(header, new_hmac)
+        footer = int(0x3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A).to_bytes(32, byteorder='big')
+        keyed_footer = xor_bytes(footer, new_hmac)
 
-            # now take plain and compute the hashes
-            hash_len = ciphertext_len - 0x1E0
-            print("hash_len: ", hash_len)
-            h1 = SHA256.new()
-            k = 0
-            while k < hash_len:
-                h1.update(bitflip(plain[k:k+16], 32))
-                k = k + 16
+        # add the header
+        plaintext.extend(keyed_header)
+        plaintext.extend(header)
 
-            print("plain top: ", binascii.hexlify(plain[:64]))
-            print("plain bottom: ", binascii.hexlify(plain[hash_len-64:hash_len]))
-            h1_digest = h1.digest()
+        # insert the bitstream plaintext. Last 160 bytes are chopped off, as there will be re-generated with the new HMAC
+        plaintext.extend(plain_bitstream[64:-160])
 
-            print("digest1 (in stored order): ", binascii.hexlify(bitflip(h1_digest)))
-            print("(this digest is zeroed in the bitstream)")
+        # compute first HMAC of stream with new HMAC key
+        h1 = SHA256.new()
+        k = 0
+        while k < len(plaintext) - 320:  # HMAC does /not/ cover the whole file, it stops 320 bytes short of the end
+            h1.update(bitflip(plaintext[k:k+16], 32))
+            k = k + 16
+        h1_digest = h1.digest()
+        logging.debug("new digest1 (in stored order): %s", binascii.hexlify(bitflip(h1_digest)))
 
-            h2 = SHA256.new()
-            footer = int(0x3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A3A).to_bytes(32, byteorder='big')
-            hmac_key = bitflip(int(1).to_bytes(32, byteorder='big'))
-            keyed_footer = xor_bytes(footer, hmac_key)
-            print('keyed_footer: ', binascii.hexlify(keyed_footer))
-            h2.update(bitflip(keyed_footer))
-            print('footer: ', binascii.hexlify(footer))
-            h2.update(bitflip(footer))
-            print('digest: ', binascii.hexlify(bitflip(h1_digest)))
-            h2.update(h1_digest)
-            h2_digest = h2.digest()
-            print("digest2: ", binascii.hexlify(h2_digest))
-            print("final digest2 (in stored order): ", binascii.hexlify(bitflip(h2_digest)))
+        # add the footer
+        plaintext.extend(keyed_footer)
+        plaintext.extend(footer)
+        plaintext.extend(bytes(32)) # empty spot where hash #1 would be stored
+        hash_pad = [ # sha-256 padding for the zero'd hash #1, which is in the bitstream and seems necessary for verification
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00,
+        ]
+        plaintext.extend(hash_pad)
 
-            print("hmac as found in file (should match above): ", binascii.hexlify(plain[ciphertext_len-32:]))
-            exit(0)
+        # compute the hash of the hash, presumably to prevent length extension attacks?
+        h2 = SHA256.new()
+        h2.update(bitflip(keyed_footer))
+        h2.update(bitflip(footer))
+        h2.update(h1_digest)
+        h2_digest = h2.digest()
 
-    else:
-        print("no command specified, exiting")
+        # commit the final HMAC to the bitstream plaintext
+        plaintext.extend(bitflip(h2_digest))
+        logging.debug("new digest2: %s", binascii.hexlify(bitflip(h2_digest)))
+
+        # format the new key into the bytes needed by Pycryptodome
+        new_key_formatted = int(new_key, 16).to_bytes(32, byteorder='big')
+        logging.debug("new key as used: %s", binascii.hexlify(new_key_formatted))
+        logging.debug("new iv as used: %s", binascii.hexlify(new_iv))
+        # encrypt the bitstream
+        newcipher = AES.new(new_key_formatted, AES.MODE_CBC, new_iv)
+
+        # generate the plaintext for debugging if needed
+        if args.debug:
+            with open("debug.bin", "wb") as dbg:
+                dbg.write(plaintext)
+
+        # finally generate the ciphertext block, which encapsulates the HMACs
+        ciphertext = newcipher.encrypt(bytes(plaintext))
+
+        # add ciphertext to the bitstream
+        f.write(bitflip(ciphertext))
+
+        # add the cleartext postamble to the bitstream. These are a series of NOP commands to the bitstream engine
+        postamble = bytearray([0x20, 00, 00, 00])
+        for i in range(0,220):
+            f.write(postamble)
 
 
 if __name__ == "__main__":

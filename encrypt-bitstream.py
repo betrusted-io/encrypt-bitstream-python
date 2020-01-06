@@ -122,6 +122,9 @@ For some reason, hmac digest #1	area is	zeroed out after its computation?
 
 # This is a fixed header for the bitstream, contains sync patterns and configures options such
 # as the bitwidth of the config, voltage, etc. This one configures 66MHz config speed, x1, 1.8V
+# Making a static copy of this header because it contains commands that modify the operation
+# of the FPGA; if we just copy from the incoming bitstream, an attacker may be able to manipulate the
+# setup commands in a way that can affect the encryption settings.
 bitstream_header_x1 = [
 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,

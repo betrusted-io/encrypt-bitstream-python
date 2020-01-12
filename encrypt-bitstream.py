@@ -184,11 +184,49 @@ def xor_bytes(a, b):
 
     return bytes(y)
 
+def patcher(bit_in, patch):
+    bitstream = bit_in[64:-160]
+
+    if len(patch) > 0:
+        # find beginning of type2 area
+        position = 0
+        type = -1
+        command = 0
+        while type != 2:
+            command = int.from_bytes(bitflip(bitstream[position:position+4]), byteorder='big')
+            position = position + 4
+            if (command & 0xE0000000) == 0x20000000:
+                type = 1
+            elif (command & 0xE0000000) == 0x40000000:
+                type = 2
+            else:
+                type = -1
+        count = 0x3ffffff & command  # not used, but handy to have around
+
+        ostream = bytearray(bitstream)
+        # position now sits at the top of the type2 region
+        # apply patches to each frame specified, ignoring the "none" values
+        for line in patch:
+            d = line[1]
+            for index in range(len(d)):
+                if d[index].strip() != 'none':
+                    data = bitflip(int(d[index],16).to_bytes(4, 'big'))
+                    frame_num = int(line[0],16)
+                    for b in range(4):
+                        stream_pos = position + frame_num * 101 * 4 + index * 4 + b
+                        ostream[stream_pos] = data[b]
+
+        return bytes(ostream)
+    else:
+        return bitstream
 
 def main():
     parser = argparse.ArgumentParser(description="Re-encrypt 7-series bitstream with a new key")
     parser.add_argument(
-        "-f", "--file", required=True, help="Root filename for input file. Expects .bin and .nky extensions.", type=str
+        "-f", "--file", required=True, help="Root filename for input file. Expects .bin extension.", type=str
+    )
+    parser.add_argument(
+        "-i", "--input-key", required=True, help="Root name for the input file key. Expects .nky suffix.", type=str
     )
     parser.add_argument(
         "-k", "--key", required=True, help="Root filename of new key to encrypt to. Expects .nky suffix.", type=str
@@ -199,6 +237,9 @@ def main():
     parser.add_argument(
         "-d", "--debug", help="turn on debugging spew", default=False, action="store_true"
     )
+    parser.add_argument(
+        "-p", "--patch", help="patch frames, expects .patch suffix", type=str
+    )
     args = parser.parse_args()
 
     ifile = args.file
@@ -208,8 +249,17 @@ def main():
     if args.debug:
         logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
 
+    patch = []
+    if args.patch != None:
+        patchfile = args.patch
+        with open(patchfile + ".patch", "r") as pf:
+            for lines in pf:
+              line = lines.split(',')
+              patch += [[line[0], line[1:]]]
+            # note: patches must be ordered by frame offset
+
     # extract the original key, HMAC, and IV
-    with open(ifile + ".nky", "r") as nky:
+    with open(args.input_key + ".nky", "r") as nky:
         for lines in nky:
             line = lines.split(' ')
             if line[1] == '0':
@@ -286,8 +336,12 @@ def main():
         plaintext.extend(keyed_header)
         plaintext.extend(header)
 
-        # insert the bitstream plaintext. Last 160 bytes are chopped off, as there will be re-generated with the new HMAC
-        plaintext.extend(plain_bitstream[64:-160])
+        # patch the plaintext bitstream, if requested. Also chops the bitstream down to the core size
+        # Function chops off last 160 bytes, as there will be re-generated with the new HMAC, and header is skipped
+        plain_patched = patcher(plain_bitstream, patch)
+
+        # insert the bitstream plaintext.
+        plaintext.extend(plain_patched)
 
         # compute first HMAC of stream with new HMAC key
         h1 = SHA256.new()
@@ -328,8 +382,8 @@ def main():
 
         # generate the plaintext for debugging if needed
         if args.debug:
-            with open("debug.bin", "wb") as dbg:
-                dbg.write(plaintext)
+            with open("debug.clr", "wb") as dbg:
+                dbg.write(bitflip(plaintext))
 
         # finally generate the ciphertext block, which encapsulates the HMACs
         ciphertext = newcipher.encrypt(bytes(plaintext))

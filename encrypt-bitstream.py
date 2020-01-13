@@ -220,16 +220,44 @@ def patcher(bit_in, patch):
     else:
         return bitstream
 
+def dumpframes(ofile, framestream):
+    position = 0
+    type = -1
+
+    command = 0
+    while type != 2:
+        command = int.from_bytes(framestream[position:position+4], byteorder='big')
+        position = position + 4
+        if (command & 0xE0000000) == 0x20000000:
+            type = 1
+        elif (command & 0xE0000000) == 0x40000000:
+            type = 2
+        else:
+            type = -1
+    count = 0x3ffffff & command
+    end = position + count
+    framecount = 0
+
+    while position < end:
+        ofile.write('0x{:08x},'.format(framecount))
+        framecount = framecount + 1
+        for i in range(101):
+            command = int.from_bytes(framestream[position:position + 4], byteorder='big')
+            position = position + 4
+            ofile.write(' 0x{:08x},'.format(command))
+        ofile.write('\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description="Re-encrypt 7-series bitstream with a new key")
     parser.add_argument(
-        "-f", "--file", required=True, help="Root filename for input file. Expects .bin extension.", type=str
+        "-f", "--file", required=True, help="Root filename for input file. Should be a .bin (not .bit)", type=str
     )
     parser.add_argument(
-        "-i", "--input-key", required=True, help="Root name for the input file key. Expects .nky suffix.", type=str
+        "-i", "--input-key", required=True, help="Root name for the input file key. Uses .nky format.", type=str
     )
     parser.add_argument(
-        "-k", "--key", required=True, help="Root filename of new key to encrypt to. Expects .nky suffix.", type=str
+        "-k", "--key", required=True, help="Root filename of new key to encrypt to. Uses .nky format.", type=str
     )
     parser.add_argument(
         "-o", "--output-file", help="output filename root. Generates .bin and .nky files", type=str
@@ -238,13 +266,17 @@ def main():
         "-d", "--debug", help="turn on debugging spew", default=False, action="store_true"
     )
     parser.add_argument(
-        "-p", "--patch", help="patch frames, expects .patch suffix", type=str
+        "-a", "--ascii-frame-file", help="dump ascii frames to this file", type=str
+    )
+    parser.add_argument(
+        "-p", "--patch", help="file containing patch frames, as output by key2bits.py", type=str
     )
     args = parser.parse_args()
 
     ifile = args.file
     ofile = args.output_file
     keyfile = args.key
+    framefile = args.ascii_frame_file
 
     if args.debug:
         logging.basicConfig(stream=sys.stdout, level=logging.DEBUG)
@@ -252,14 +284,14 @@ def main():
     patch = []
     if args.patch != None:
         patchfile = args.patch
-        with open(patchfile + ".patch", "r") as pf:
+        with open(patchfile, "r") as pf:
             for lines in pf:
               line = lines.split(',')
               patch += [[line[0], line[1:]]]
             # note: patches must be ordered by frame offset
 
     # extract the original key, HMAC, and IV
-    with open(args.input_key + ".nky", "r") as nky:
+    with open(args.input_key, "r") as nky:
         for lines in nky:
             line = lines.split(' ')
             if line[1] == '0':
@@ -273,7 +305,7 @@ def main():
     logging.debug("original iv:   %s", nky_iv)
     logging.debug("original hmac: %s", nky_hmac)
 
-    with open(keyfile + ".nky", "r") as nky:
+    with open(keyfile, "r") as nky:
         for lines in nky:
             line = lines.split(' ')
             if line[1] == '0':
@@ -300,7 +332,7 @@ def main():
     logging.debug("old key: %s", binascii.hexlify(key_bytes))
 
     # open the input file, and recover the plaintext
-    with open(ifile + ".bin", "rb") as f:
+    with open(ifile, "rb") as f:
         binfile = f.read()
 
         ciphertext_len = 4* int.from_bytes(binfile[180:184], 'big')
@@ -384,6 +416,11 @@ def main():
         if args.debug:
             with open("debug.clr", "wb") as dbg:
                 dbg.write(bitflip(plaintext))
+
+        # make a frame dump if requested
+        if framefile != None:
+            with open(framefile, "w") as frameoutput:
+                dumpframes(frameoutput, bitflip(plaintext[64:-160])) # strip off hash header and footer before outputting frames
 
         # finally generate the ciphertext block, which encapsulates the HMACs
         ciphertext = newcipher.encrypt(bytes(plaintext))

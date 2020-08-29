@@ -271,6 +271,9 @@ def main():
     parser.add_argument(
         "-p", "--patch", help="file containing patch frames, as output by key2bits.py", type=str
     )
+    parser.add_argument(
+        "-j", "--jtag-commands", help="Make JTAG command sequence for BBRAM programming via jtag-gpio.py", default=False, action="store_true"
+    )
     args = parser.parse_args()
 
     ifile = args.file
@@ -330,6 +333,21 @@ def main():
 
     key_bytes = int(nky_key, 16).to_bytes(32, byteorder='big')
     logging.debug("old key: %s", binascii.hexlify(key_bytes))
+
+    if args.jtag_commands:
+        with open(ofile + ".jtg", "w") as jfile:
+            jfile.write("ir, 6, 0b010010, program_key\n")
+            jfile.write("dr, 32, 0xffffffff\n")
+            jfile.write("ir, 6, 0b010001, isc_program\n")
+            jfile.write("dr, 32, 0x557b\n")
+            for index in range(0, 8):
+                jfile.write("ir, 6, 0b010001, isc_program\n")
+                jfile.write("dr, 32, 0x{}\n".format(new_key[index*8:(index+1)*8]))
+            jfile.write("ir, 6, 0b010101, bbkey_rbk\n")
+            jfile.write("dr, 37, 0x1fffffffff\n")
+            for index in range(0, 8):
+                jfile.write("ir, 6, 0b010101, bbkey_rbk\n")
+                jfile.write("dr, 37, 0x1fffffffff\n")
 
     # open the input file, and recover the plaintext
     with open(ifile, "rb") as f:

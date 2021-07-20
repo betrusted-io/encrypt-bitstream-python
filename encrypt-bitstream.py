@@ -150,7 +150,7 @@ bitstream_header_x2 = [
 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x01, 0x60, 0x04,
 ]
-bitstream_header_bbram = [
+bitstream_header_bbram_x1 = [
 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 0x00, 0x00, 0x00, 0xbb, 0x11, 0x22, 0x00, 0x44, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -161,6 +161,18 @@ bitstream_header_bbram = [
 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x01, 0x60, 0x04,
+]
+# this selects BBRAM for key on a 35T
+bitstream_header_35t_bbram_x1 = [
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0x00, 0x00, 0x00, 0xBB, 0x11, 0x22, 0x00, 0x44, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xAA, 0x99, 0x55, 0x66, 0x20, 0x00, 0x00, 0x00, 0x30, 0x00, 0xC0, 0x01, 0x00, 0x00, 0x00, 0x40,
+  0x30, 0x00, 0xA0, 0x01, 0x00, 0x00, 0x00, 0x40, 0x30, 0x01, 0xC0, 0x01, 0x00, 0x00, 0x00, 0x00,
+  0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00,
+  0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x30, 0x01, 0x60, 0x04
 ]
 # then IV key is here 16 bytes
 ciphertext_header = [
@@ -286,6 +298,12 @@ def main():
     parser.add_argument(
         "-p", "--patch", help="file containing patch frames, as output by key2bits.py", type=str
     )
+    parser.add_argument(
+        "-j", "--jtag-commands", help="Make JTAG command sequence for BBRAM programming via jtag-gpio.py", default=False, action="store_true"
+    )
+    parser.add_argument(
+        "-t", "--type", choices=['xc7s50', 'xc7a35t'], default='xc7s50', help="select device target", type=str
+    )
     args = parser.parse_args()
 
     ifile = args.file
@@ -332,7 +350,10 @@ def main():
 
     # format a .nky for the output .bin
     with open(ofile + ".nky", "w") as newkey:
-        newkey.write("Device xc7s50;\n")
+        if args.type == 'xc7a35t':
+            newkey.write("Device xc7a35t;\n")
+        else:
+            newkey.write("Device xc7s50;\n")
         newkey.write("Key 0 ")
         newkey.write(new_key)
         newkey.write(";\n")
@@ -346,16 +367,51 @@ def main():
     key_bytes = int(nky_key, 16).to_bytes(32, byteorder='big')
     logging.debug("old key: %s", binascii.hexlify(key_bytes))
 
+    if args.jtag_commands:
+        with open(ofile + ".jtg", "w") as jfile:
+            jfile.write("ir, 6, 0b010010, program_key\n")
+            jfile.write("dr, 32, 0xffffffff\n")
+            jfile.write("ir, 6, 0b010001, isc_program\n")
+            jfile.write("dr, 32, 0x557b\n")
+            for index in range(0, 8):
+                jfile.write("ir, 6, 0b010001, isc_program\n")
+                jfile.write("dr, 32, 0x{}\n".format(new_key[index*8:(index+1)*8]))
+            jfile.write("ir, 6, 0b010101, bbkey_rbk\n")
+            jfile.write("dr, 37, 0x1fffffffff\n")
+            for index in range(0, 8):
+                jfile.write("ir, 6, 0b010101, bbkey_rbk\n")
+                jfile.write("dr, 37, 0x1fffffffff\n")
+
     # open the input file, and recover the plaintext
     with open(ifile, "rb") as f:
         binfile = f.read()
 
-        ciphertext_len = 4* int.from_bytes(binfile[180:184], 'big')
+        # search for structure
+        # 0x3001_6004 -> specifies the CBC key
+        # 4 words of CBC IV
+        # 0x3003_4001 -> ciphertext len
+        # 1 word of ciphertext len
+        # then ciphertext
+
+        position = 0
+        iv_pos = 0
+        while position < len(binfile):
+            cwd = int.from_bytes(binfile[position:position+4], 'big')
+            if cwd == 0x3001_6004:
+                iv_pos = position+4
+            if cwd == 0x3003_4001:
+                break
+            position = position + 1
+
+        position = position + 4
+
+        ciphertext_len = 4* int.from_bytes(binfile[position:position+4], 'big')
         logging.debug("ciphertext len: %d", ciphertext_len)
+        position = position + 4
 
-        active_area = binfile[184:184 + ciphertext_len]
+        active_area = binfile[position : position+ciphertext_len]
 
-        iv_bytes = bitflip(binfile[0xa0:0xb0])  # note that the IV is embedded in the file
+        iv_bytes = bitflip(binfile[iv_pos : iv_pos+0x10])  # note that the IV is embedded in the file
         logging.debug("recovered iv: %s", binascii.hexlify(iv_bytes))
 
         cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
@@ -363,15 +419,19 @@ def main():
 
     # now construct the output file and its hashes
     global bitstream_header_x1
-    global bitstream_header_bbram
+    global bitstream_header_bbram_x1
+    global bitstream_header_35t_bbram_x1
     plaintext = bytearray()
     with open(ofile + ".bin", "wb") as f:
-        if args.bbram:
-            for item in bitstream_header_bbram:  # add the cleartext header (bbram)
-                f.write(bytes([item]))
+        if args.type == 'xc7a35t':
+            device_header = bitstream_header_35t_bbram_x1
+        elif args.bbram:
+            device_header = bitstream_header_bbram_x1
         else:
-            for item in bitstream_header_x1:  # add the cleartext header (efuse)
-                f.write(bytes([item]))
+            device_header = bitstream_header_x1
+
+        for item in device_header:  # add the cleartext header
+            f.write(bytes([item]))
 
         f.write(bitflip(new_iv)) # insert the IV
 
